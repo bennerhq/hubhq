@@ -1,0 +1,16 @@
+{
+  "name": "ikea",
+  "version": "1.0.0",
+  "description": "Personal Go CLI for a local IKEA DIRIGERA hub.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dirigera": "^1.8.0"
+  }
+}

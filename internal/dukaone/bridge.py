@@ -136,6 +136,11 @@ def run(args):
                 device = client.validate_device(device_id, args.password, args.ip_address)
                 if device is None:
                     continue
+                try:
+                    device.wait_for_initialize()
+                except Exception:
+                    pass
+                refresh_device(client, device)
                 devices.append(serialize(device, args.ip_address))
             print(json.dumps({"devices": devices}))
             return

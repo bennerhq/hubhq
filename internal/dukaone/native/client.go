@@ -17,7 +17,7 @@ func New() *Client {
 	return &Client{Port: udpPort}
 }
 
-func (c *Client) Discover(ctx context.Context, broadcast string, timeout time.Duration) ([]State, error) {
+func (c *Client) Discover(ctx context.Context, broadcast, password string, timeout time.Duration) ([]State, error) {
 	conn, err := c.listen()
 	if err != nil {
 		return nil, err
@@ -60,8 +60,9 @@ func (c *Client) Discover(ctx context.Context, broadcast string, timeout time.Du
 		found[resp.SearchDeviceID] = item
 	}
 	out := make([]State, 0, len(found))
+	time.Sleep(300 * time.Millisecond)
 	for _, item := range found {
-		state, err := c.ReadState(ctx, item.DeviceID, "1111", item.IPAddress, 2*time.Second)
+		state, err := c.ReadState(ctx, item.DeviceID, firstNonEmpty(password, "1111"), item.IPAddress, 5*time.Second)
 		if err != nil {
 			out = append(out, item)
 			continue

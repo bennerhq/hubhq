@@ -88,7 +88,7 @@ func Discover(ctx context.Context, cfg *config.Config, broadcast string, timeout
 		if timeoutSeconds > 0 {
 			timeout = timeoutSeconds
 		}
-		states, err := native.New().Discover(ctx, strings.TrimSpace(broadcast), time.Duration(timeout*float64(time.Second)))
+		states, err := native.New().Discover(ctx, strings.TrimSpace(broadcast), firstNonEmpty(cfg.DukaOne.Password, "1111"), time.Duration(timeout*float64(time.Second)))
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +96,7 @@ func Discover(ctx context.Context, cfg *config.Config, broadcast string, timeout
 		for _, state := range states {
 			device := config.DukaOneDeviceConfig{
 				DeviceID: state.DeviceID,
-				Name:     state.DeviceID,
+				Name:     DefaultName(state.DeviceID),
 				Host:     firstNonEmpty(state.IPAddress, broadcast),
 			}
 			items = append(items, normalize(device, stateToBridgeResponse(state)))
@@ -123,7 +123,7 @@ func Discover(ctx context.Context, cfg *config.Config, broadcast string, timeout
 	for _, state := range response.Devices {
 		device := config.DukaOneDeviceConfig{
 			DeviceID: state.DeviceID,
-			Name:     state.DeviceID,
+			Name:     DefaultName(state.DeviceID),
 			Host:     firstNonEmpty(state.IPAddress, broadcast),
 		}
 		items = append(items, normalize(device, state))

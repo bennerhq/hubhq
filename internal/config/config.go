@@ -27,6 +27,7 @@ type Config struct {
 	Apple      AppleConfig    `json:"apple"`
 	DukaOne    DukaOneConfig  `json:"dukaone"`
 	Location   LocationConfig `json:"location"`
+	Access     AccessConfig   `json:"access"`
 	Cache      Cache          `json:"-"`
 }
 
@@ -103,6 +104,10 @@ type LocationConfig struct {
 	TimeZone  string  `json:"time_zone,omitempty"`
 }
 
+type AccessConfig struct {
+	Path string `json:"path,omitempty"`
+}
+
 type tokenFile struct {
 	Hubs map[string]string `json:"hubs"`
 }
@@ -115,6 +120,7 @@ type legacyConfig struct {
 	Apple      AppleConfig          `json:"apple"`
 	DukaOne    DukaOneConfig        `json:"dukaone"`
 	Location   LocationConfig       `json:"location"`
+	Access     AccessConfig         `json:"access"`
 }
 
 type legacyHub struct {
@@ -181,6 +187,7 @@ func Save(cfg *Config) error {
 		Apple:      cfg.Apple,
 		DukaOne:    cfg.DukaOne,
 		Location:   cfg.Location,
+		Access:     cfg.Access,
 	}
 	for id, hub := range cfg.Hubs {
 		copyHub := hub
@@ -257,6 +264,71 @@ func AppDir() (string, error) {
 		return "", err
 	}
 	return filepath.Dir(path), nil
+}
+
+func AccessRoot(cfg *Config) (string, error) {
+	if cfg != nil && strings.TrimSpace(cfg.Access.Path) != "" {
+		return filepath.Clean(strings.TrimSpace(cfg.Access.Path)), nil
+	}
+	dir, err := AppDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "access"), nil
+}
+
+func AccessDataDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "data")
+}
+
+func AccessHTMLDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "html")
+}
+
+func AccessSoundsDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "sounds")
+}
+
+func AccessScriptsDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "scripts")
+}
+
+func AccessSkillsDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "skills")
+}
+
+func AccessToolsDir(cfg *Config) (string, error) {
+	return accessSubdir(cfg, "tools")
+}
+
+func EnsureAccessLayout(cfg *Config) error {
+	root, err := AccessRoot(cfg)
+	if err != nil {
+		return err
+	}
+	dirs := []string{
+		root,
+		filepath.Join(root, "data"),
+		filepath.Join(root, "html"),
+		filepath.Join(root, "sounds"),
+		filepath.Join(root, "scripts"),
+		filepath.Join(root, "skills"),
+		filepath.Join(root, "tools"),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create access dir %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func accessSubdir(cfg *Config, name string) (string, error) {
+	root, err := AccessRoot(cfg)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, name), nil
 }
 
 func TokensPath() (string, error) {

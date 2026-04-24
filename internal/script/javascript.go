@@ -66,7 +66,7 @@ func (JavaScriptEngine) Execute(ctx context.Context, execCtx ExecContext, doc Do
 	if execCtx.Now != nil {
 		now = execCtx.Now
 	}
-	wrapper, err := buildNodeWrapper(doc, devices, scenes, speakers, state, now())
+	wrapper, err := buildNodeWrapper(doc, devices, scenes, speakers, state, now(), execCtx.ScriptInput, execCtx.ScriptArgs, execCtx.StdinText)
 	if err != nil {
 		return nil, err
 	}
@@ -122,21 +122,28 @@ func (JavaScriptEngine) Execute(ctx context.Context, execCtx ExecContext, doc Do
 const protocolPrefix = "__DIRIGERA__"
 
 type protocolMessage struct {
-	Type      string         `json:"type"`
-	Op        string         `json:"op,omitempty"`
-	RequestID string         `json:"request_id,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Sound     string         `json:"sound,omitempty"`
-	Room      string         `json:"room,omitempty"`
-	Key       string         `json:"key,omitempty"`
-	Attrs     map[string]any `json:"attrs,omitempty"`
-	Message   string         `json:"message,omitempty"`
-	Value     any            `json:"value,omitempty"`
-	Error     string         `json:"error,omitempty"`
+	Type           string            `json:"type"`
+	Op             string            `json:"op,omitempty"`
+	RequestID      string            `json:"request_id,omitempty"`
+	ID             string            `json:"id,omitempty"`
+	Name           string            `json:"name,omitempty"`
+	Sound          string            `json:"sound,omitempty"`
+	Method         string            `json:"method,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Room           string            `json:"room,omitempty"`
+	Scope          string            `json:"scope,omitempty"`
+	Path           string            `json:"path,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	Key            string            `json:"key,omitempty"`
+	Attrs          map[string]any    `json:"attrs,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	Value          any               `json:"value,omitempty"`
+	Error          string            `json:"error,omitempty"`
 }
 
-func buildNodeWrapper(doc Document, devices, scenes, speakers []map[string]any, state map[string]any, now time.Time) (string, error) {
+func buildNodeWrapper(doc Document, devices, scenes, speakers []map[string]any, state map[string]any, now time.Time, input any, args []string, stdinText string) (string, error) {
 	source := base64.StdEncoding.EncodeToString([]byte(doc.Source))
 	entry, err := json.Marshal(firstNonEmpty(doc.EntryPoint, "main"))
 	if err != nil {
@@ -162,6 +169,18 @@ func buildNodeWrapper(doc Document, devices, scenes, speakers []map[string]any, 
 	if err != nil {
 		return "", err
 	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return "", err
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return "", err
+	}
+	stdinJSON, err := json.Marshal(stdinText)
+	if err != nil {
+		return "", err
+	}
 	return fmt.Sprintf(`const entryPoint = %s;
 const source = Buffer.from(%q, "base64").toString("utf8");
 const devices = %s;
@@ -169,6 +188,9 @@ const scenes = %s;
 const speakers = %s;
 const state = %s;
 const nowIso = %s;
+const scriptInput = %s;
+const scriptArgs = %s;
+const stdinText = %s;
 const emit = (payload) => process.stdout.write(%q + JSON.stringify(payload) + "\n");
 const normalize = (value) => String(value || "").trim().toLowerCase();
 let request = async () => { throw new Error("request bridge not initialized"); };
@@ -302,6 +324,58 @@ const api = {
       return true;
     },
   },
+  access: {
+    root: async () => await request("access.root"),
+    list: async (scope, path = ".") => await request("access.list", { scope, path }),
+    readText: async (scope, path) => await request("access.readText", { scope, path }),
+    writeText: async (scope, path, value) => await request("access.writeText", { scope, path, value }),
+    readJson: async (scope, path) => await request("access.readJson", { scope, path }),
+    writeJson: async (scope, path, value) => await request("access.writeJson", { scope, path, value }),
+    delete: async (scope, path) => await request("access.delete", { scope, path }),
+    listScripts: async () => await request("access.listScripts"),
+    runScript: async (name, args = [], input = null) => await request("access.runScript", { name, args, value: input }),
+  },
+  web: {
+    request: async (method, url, options = {}) => {
+      const payload = {
+        method: String(method || "GET"),
+        url: String(url || ""),
+        headers: (options && options.headers) || {},
+      };
+      if (options && Object.prototype.hasOwnProperty.call(options, "body")) {
+        payload.value = options.body;
+      }
+      return await request("http.do", payload);
+    },
+    get: async (url, headers = {}) => await request("http.do", { method: "GET", url: String(url || ""), headers }),
+    post: async (url, body = null, headers = {}) => await request("http.do", { method: "POST", url: String(url || ""), headers, value: body }),
+  },
+  tools: {
+    run: async (name, options = {}) => await request("tools.run", {
+      name: String(name || ""),
+      args: Array.isArray(options.args) ? options.args : [],
+      value: Object.prototype.hasOwnProperty.call(options, "stdin") ? String(options.stdin ?? "") : "",
+      timeout_seconds: Number(options.timeout_seconds || 30),
+    }),
+  },
+  script: {
+    input: () => scriptInput,
+    args: () => scriptArgs.slice(),
+  },
+  stdin: {
+    readText: () => stdinText,
+    readJson: () => JSON.parse(stdinText || "null"),
+  },
+  stdout: {
+    write: (value) => emit({ type: "stdout", message: String(value ?? "") }),
+    writeLine: (value = "") => emit({ type: "stdout", message: String(value ?? "") + "\n" }),
+    writeJson: (value) => emit({ type: "stdout", message: JSON.stringify(value) + "\n" }),
+  },
+  stderr: {
+    write: (value) => emit({ type: "stderr", message: String(value ?? "") }),
+    writeLine: (value = "") => emit({ type: "stderr", message: String(value ?? "") + "\n" }),
+    writeJson: (value) => emit({ type: "stderr", message: JSON.stringify(value) + "\n" }),
+  },
 };
 (function setupProtocolResponses() {
   const readline = require("node:readline");
@@ -340,7 +414,7 @@ const api = {
     if (typeof entry !== "function") {
       throw new Error("entry point not found: " + entryPoint);
     }
-    const value = await entry(api);
+    const value = await entry(api, scriptInput, scriptArgs);
     if (typeof globalThis.__hubhqCloseProtocol === "function") {
       globalThis.__hubhqCloseProtocol();
     }
@@ -354,7 +428,7 @@ const api = {
     process.exit(1);
   }
 })();
-`, string(entry), source, string(devicesJSON), string(scenesJSON), string(speakersJSON), string(stateJSON), string(nowJSON), protocolPrefix), nil
+`, string(entry), source, string(devicesJSON), string(scenesJSON), string(speakersJSON), string(stateJSON), string(nowJSON), string(inputJSON), string(argsJSON), string(stdinJSON), protocolPrefix), nil
 }
 
 func handleProtocolMessage(ctx context.Context, execCtx ExecContext, result *Result, stdin io.Writer, raw string) error {
@@ -368,6 +442,20 @@ func handleProtocolMessage(ctx context.Context, execCtx ExecContext, result *Res
 			result.Logs = append(result.Logs, msg.Message)
 			if execCtx.Logger != nil {
 				execCtx.Logger.Printf("%s", msg.Message)
+			}
+		}
+		return nil
+	case "stdout":
+		if execCtx.Stdout != nil && msg.Message != "" {
+			if _, err := io.WriteString(execCtx.Stdout, msg.Message); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "stderr":
+		if execCtx.Stderr != nil && msg.Message != "" {
+			if _, err := io.WriteString(execCtx.Stderr, msg.Message); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -481,6 +569,33 @@ func handleProtocolMessage(ctx context.Context, execCtx ExecContext, result *Res
 			}
 			result.Updated = true
 			return nil
+		case "access.writeText":
+			if execCtx.Access == nil {
+				return fmt.Errorf("access service is not configured")
+			}
+			if err := execCtx.Access.WriteText(ctx, msg.Scope, msg.Path, fmt.Sprint(msg.Value)); err != nil {
+				return err
+			}
+			result.Updated = true
+			return nil
+		case "access.writeJson":
+			if execCtx.Access == nil {
+				return fmt.Errorf("access service is not configured")
+			}
+			if err := execCtx.Access.WriteJSON(ctx, msg.Scope, msg.Path, msg.Value); err != nil {
+				return err
+			}
+			result.Updated = true
+			return nil
+		case "access.delete":
+			if execCtx.Access == nil {
+				return fmt.Errorf("access service is not configured")
+			}
+			if err := execCtx.Access.Delete(ctx, msg.Scope, msg.Path); err != nil {
+				return err
+			}
+			result.Updated = true
+			return nil
 		default:
 			return fmt.Errorf("unsupported javascript operation %q", msg.Op)
 		}
@@ -494,11 +609,11 @@ func handleProtocolRequest(ctx context.Context, execCtx ExecContext, msg protoco
 		Type:      "response",
 		RequestID: msg.RequestID,
 	}
-	if execCtx.Devices == nil {
-		return response, fmt.Errorf("devices service is not configured")
-	}
 	switch msg.Op {
 	case "devices.getLiveByID":
+		if execCtx.Devices == nil {
+			return response, fmt.Errorf("devices service is not configured")
+		}
 		item, err := execCtx.Devices.GetLiveDeviceByID(ctx, msg.ID)
 		if err != nil {
 			return response, err
@@ -506,6 +621,9 @@ func handleProtocolRequest(ctx context.Context, execCtx ExecContext, msg protoco
 		response.Value = item
 		return response, nil
 	case "devices.getLiveByName":
+		if execCtx.Devices == nil {
+			return response, fmt.Errorf("devices service is not configured")
+		}
 		item, err := execCtx.Devices.GetLiveDeviceByName(ctx, msg.Name)
 		if err != nil {
 			return response, err
@@ -513,6 +631,9 @@ func handleProtocolRequest(ctx context.Context, execCtx ExecContext, msg protoco
 		response.Value = item
 		return response, nil
 	case "devices.listLiveByRoom":
+		if execCtx.Devices == nil {
+			return response, fmt.Errorf("devices service is not configured")
+		}
 		items, err := execCtx.Devices.ListLiveDevicesByRoom(ctx, msg.Room)
 		if err != nil {
 			return response, err
@@ -520,6 +641,9 @@ func handleProtocolRequest(ctx context.Context, execCtx ExecContext, msg protoco
 		response.Value = items
 		return response, nil
 	case "devices.listLiveByType":
+		if execCtx.Devices == nil {
+			return response, fmt.Errorf("devices service is not configured")
+		}
 		items, err := execCtx.Devices.ListLiveDevicesByType(ctx, fmt.Sprint(msg.Value))
 		if err != nil {
 			return response, err
@@ -527,11 +651,94 @@ func handleProtocolRequest(ctx context.Context, execCtx ExecContext, msg protoco
 		response.Value = items
 		return response, nil
 	case "devices.listLiveByName":
+		if execCtx.Devices == nil {
+			return response, fmt.Errorf("devices service is not configured")
+		}
 		items, err := execCtx.Devices.ListLiveDevicesByName(ctx, msg.Name)
 		if err != nil {
 			return response, err
 		}
 		response.Value = items
+		return response, nil
+	case "access.root":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.Root(ctx)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "access.list":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.List(ctx, msg.Scope, msg.Path)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "access.readText":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.ReadText(ctx, msg.Scope, msg.Path)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "access.readJson":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.ReadJSON(ctx, msg.Scope, msg.Path)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "access.listScripts":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.ListScripts(ctx)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "access.runScript":
+		if execCtx.Access == nil {
+			return response, fmt.Errorf("access service is not configured")
+		}
+		value, err := execCtx.Access.RunScript(ctx, msg.Name, msg.Args, msg.Value)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "http.do":
+		if execCtx.HTTP == nil {
+			return response, fmt.Errorf("http client is not configured")
+		}
+		value, err := execCtx.HTTP.Do(ctx, msg.Method, msg.URL, msg.Value, msg.Headers)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
+		return response, nil
+	case "tools.run":
+		if execCtx.Tools == nil {
+			return response, fmt.Errorf("tool service is not configured")
+		}
+		value, err := execCtx.Tools.Run(ctx, msg.Name, msg.Args, fmt.Sprint(msg.Value), msg.TimeoutSeconds)
+		if err != nil {
+			return response, err
+		}
+		response.Value = value
 		return response, nil
 	default:
 		return response, fmt.Errorf("unsupported javascript request %q", msg.Op)

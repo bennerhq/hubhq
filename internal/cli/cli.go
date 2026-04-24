@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,7 @@ import (
 	"github.com/jbenner/hubhq/internal/llm"
 	"github.com/jbenner/hubhq/internal/output"
 	"github.com/jbenner/hubhq/internal/script"
+	"github.com/jbenner/hubhq/internal/version"
 	"golang.org/x/sys/unix"
 )
 
@@ -55,6 +57,7 @@ type command struct {
 	debug      bool
 	showScript bool
 	noLogo     bool
+	stdin      io.Reader
 	host       string
 	statusPort string
 	useHub     bool
@@ -83,17 +86,19 @@ type runtimeStatusServer struct {
 	listener  net.Listener
 }
 
-type autoRunLock struct {
-	file *os.File
-	path string
-}
-
-type autoRunLockInfo struct {
+type runtimeInstanceInfo struct {
+	ID        string    `json:"id"`
+	Mode      string    `json:"mode"`
 	PID       int       `json:"pid"`
 	Host      string    `json:"host"`
 	StartedAt time.Time `json:"started_at"`
-	HubID     string    `json:"hub_id"`
-	HubHost   string    `json:"hub_host"`
+	HubID     string    `json:"hub_id,omitempty"`
+	HubName   string    `json:"hub_name,omitempty"`
+	HubHost   string    `json:"hub_host,omitempty"`
+	HubKey    string    `json:"hub_key,omitempty"`
+	StatusURL string    `json:"status_url,omitempty"`
+	Command   string    `json:"command,omitempty"`
+	Args      []string  `json:"args,omitempty"`
 }
 
 func autoRunLogf(stdout io.Writer, format string, args ...any) {
@@ -173,6 +178,7 @@ func startRuntimeStatusServer(ctx context.Context, mode, port string) (*runtimeS
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", status.handleHTML)
 	mux.HandleFunc("/status", status.handleJSON)
+	mux.HandleFunc("/restart", status.handleRestart)
 	server := &http.Server{Handler: mux}
 	status.server = server
 	go func() {
@@ -277,6 +283,19 @@ func (s *runtimeStatusServer) handleJSON(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(s.snapshot())
 }
 
+func (s *runtimeStatusServer) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("restarting"))
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = restartCurrentProcess()
+	}()
+}
+
 func (s *runtimeStatusServer) handleHTML(w http.ResponseWriter, r *http.Request) {
 	snapshot := s.snapshot()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -318,7 +337,7 @@ func (s *runtimeStatusServer) handleHTML(w http.ResponseWriter, r *http.Request)
 }
 
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	cmd := command{stderr: stderr}
+	cmd := command{stdin: stdin, stderr: stderr}
 	args = consumeBoolFlag(args, "--json", &cmd.json)
 	args = consumeBoolFlag(args, "--yes", &cmd.yes)
 	args = consumeBoolFlag(args, "--debug", &cmd.debug)
@@ -327,6 +346,18 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	args = consumeBoolFlag(args, "--hub", &cmd.useHub)
 	args = consumeValueFlag(args, "--host", &cmd.host)
 	args = consumeValueFlag(args, "--status-port", &cmd.statusPort)
+	if len(args) > 0 && args[0] == "--version" {
+		info := version.Current()
+		if cmd.json {
+			return output.JSON(stdout, map[string]any{
+				"version": info.Version,
+				"date":    info.Date,
+				"time":    info.Time,
+			})
+		}
+		_, err := fmt.Fprintf(stdout, "%s\nDate: %s\nTime: %s\n", info.Version, info.Date, info.Time)
+		return err
+	}
 	printStartupLogo(stdout, cmd.json, cmd.noLogo)
 	if len(args) == 0 {
 		usage(stdout)
@@ -343,12 +374,12 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "help", "--help", "-h":
 		usage(stdout)
 		return nil
-	case "auth":
-		return cmd.auth(ctx, cfg, stdin, stdout)
 	case "hub":
 		return cmd.hub(ctx, cfg, args[1:], stdout)
 	case "config":
 		return cmd.config(cfg, args[1:], stdout)
+	case "access":
+		return cmd.access(ctx, cfg, args[1:], stdout)
 	case "dukaone":
 		return cmd.dukaone(ctx, cfg, args[1:], stdout)
 	case "refresh":
@@ -360,7 +391,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "scenes":
 		return cmd.scenes(ctx, cfg, args[1:], stdout)
 	case "watch":
-		return cmd.watch(ctx, cfg, stdout)
+		return cmd.watch(ctx, cfg, args[1:], stdout)
 	case "speaker":
 		return cmd.speaker(ctx, cfg, args[1:], stdout)
 	case "ask":
@@ -376,7 +407,18 @@ func printStartupLogo(stdout io.Writer, jsonMode, noLogo bool) {
 	if jsonMode || noLogo || !writerLooksInteractive(stdout) {
 		return
 	}
-	_, _ = fmt.Fprintf(stdout, "\033[1;93m%s\033[0m\n", startupLogo)
+	versionText := version.String()
+	width := 0
+	for _, line := range strings.Split(startupLogo, "\n") {
+		if len(line) > width {
+			width = len(line)
+		}
+	}
+	padding := width - len(versionText)
+	if padding < 0 {
+		padding = 0
+	}
+	_, _ = fmt.Fprintf(stdout, "\033[93m%s\033[0m\n\033[90m%s%s\033[0m\n\n", startupLogo, strings.Repeat(" ", padding), versionText)
 }
 
 func writerLooksInteractive(w io.Writer) bool {
@@ -389,6 +431,23 @@ func writerLooksInteractive(w io.Writer) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func readScriptStdin(r io.Reader) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	if file, ok := r.(*os.File); ok && file != nil {
+		info, err := file.Stat()
+		if err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			return "", nil
+		}
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", fmt.Errorf("read stdin: %w", err)
+	}
+	return string(data), nil
 }
 
 func (c command) debugf(format string, args ...any) {
@@ -477,9 +536,31 @@ func (c command) patchDeviceAttributes(ctx context.Context, cli *client.Client, 
 
 func (c command) config(cfg *config.Config, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hubhq config get <key> | set <key> <value>")
+		return errors.New("usage: hubhq config show | get <key> | set <key> <value>")
 	}
 	switch args[0] {
+	case "show":
+		accessView := cfg.Access
+		if strings.TrimSpace(accessView.Path) == "" {
+			path, err := config.AccessRoot(cfg)
+			if err != nil {
+				return err
+			}
+			accessView.Path = path
+		}
+		view := map[string]any{
+			"default_hub": cfg.DefaultHub,
+			"hubs":        cfg.Hubs,
+			"llm":         cfg.LLM,
+			"apple":       cfg.Apple,
+			"dukaone":     cfg.DukaOne,
+			"location":    cfg.Location,
+			"access":      accessView,
+		}
+		if c.json {
+			return output.JSON(stdout, view)
+		}
+		return printMap(stdout, view)
 	case "get":
 		if len(args) < 2 {
 			return errors.New("usage: hubhq config get <key>")
@@ -514,6 +595,156 @@ func (c command) config(cfg *config.Config, args []string, stdout io.Writer) err
 	}
 }
 
+func (c command) access(ctx context.Context, cfg *config.Config, args []string, stdout io.Writer) error {
+	if len(args) == 0 || args[0] == "show" {
+		root, err := config.AccessRoot(cfg)
+		if err != nil {
+			return err
+		}
+		dirs := map[string]string{}
+		builders := []struct {
+			key string
+			fn  func(*config.Config) (string, error)
+		}{
+			{key: "data", fn: config.AccessDataDir},
+			{key: "html", fn: config.AccessHTMLDir},
+			{key: "sounds", fn: config.AccessSoundsDir},
+			{key: "scripts", fn: config.AccessScriptsDir},
+			{key: "skills", fn: config.AccessSkillsDir},
+			{key: "tools", fn: config.AccessToolsDir},
+		}
+		for _, item := range builders {
+			path, err := item.fn(cfg)
+			if err != nil {
+				return err
+			}
+			dirs[item.key] = path
+		}
+		payload := map[string]any{
+			"path": root,
+			"dirs": dirs,
+		}
+		if c.json {
+			return output.JSON(stdout, payload)
+		}
+		rows := [][]string{
+			{"root", root},
+			{"data", dirs["data"]},
+			{"html", dirs["html"]},
+			{"sounds", dirs["sounds"]},
+			{"scripts", dirs["scripts"]},
+			{"skills", dirs["skills"]},
+			{"tools", dirs["tools"]},
+		}
+		return output.Table(stdout, []string{"SCOPE", "PATH"}, rows)
+	}
+	switch args[0] {
+	case "init":
+		if err := config.EnsureAccessLayout(cfg); err != nil {
+			return err
+		}
+		root, err := config.AccessRoot(cfg)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			return output.JSON(stdout, map[string]any{"status": "initialized", "path": root})
+		}
+		_, err = fmt.Fprintf(stdout, "initialized access layout at %s\n", root)
+		return err
+	case "run":
+		if len(args) < 2 {
+			return errors.New("usage: hubhq access run <script> [args...]")
+		}
+		return c.accessRun(ctx, cfg, args[1], args[2:], stdout)
+	default:
+		return fmt.Errorf("unknown access command %q", args[0])
+	}
+}
+
+func (c command) accessRun(ctx context.Context, cfg *config.Config, name string, args []string, stdout io.Writer) error {
+	stdinText, err := readScriptStdin(c.stdin)
+	if err != nil {
+		return err
+	}
+	var (
+		deviceService    script.DeviceService
+		cliClient        *client.Client
+		homeCtx          llm.HomeContext
+		speakerTargets   []speakerTarget
+		speakerSnapshots []map[string]any
+		speakerService   script.SpeakerService
+	)
+	if _, err := cfg.DefaultHubConfig(); err == nil {
+		if cli, err := hubClient(cfg); err == nil {
+			cliClient = cli
+			if collected, speakers, err := collectHomeContextWithSpeakers(ctx, cfg); err == nil {
+				homeCtx = collected
+				speakerTargets = speakers
+				speakerSnapshots = speakerSnapshotsFromHomeContext(homeCtx)
+			}
+			deviceService = runtimeDeviceService{
+				cli:              cliClient,
+				cfg:              cfg,
+				inventoryDevices: homeCtx.Devices,
+				inventoryScenes:  homeCtx.Scenes,
+				speakerTargets:   speakerTargets,
+			}
+			speakerService = runtimeSpeakerService{cmd: c, cfg: cfg, targets: speakerTargets}
+		}
+	}
+	stateStore := newRuntimeStateStore()
+	httpClient := runtimeHTTPClient{}
+	toolService := runtimeToolService{cfg: cfg}
+	logger := runtimeLogger{cmd: c}
+	accessService := runtimeAccessService{
+		cmd:              c,
+		cfg:              cfg,
+		devices:          deviceService,
+		deviceSnapshots:  homeCtx.Devices,
+		sceneSnapshots:   homeCtx.Scenes,
+		speakers:         speakerService,
+		speakerSnapshots: speakerSnapshots,
+		state:            stateStore,
+		http:             httpClient,
+		tools:            toolService,
+		logger:           logger,
+		now:              time.Now,
+		stdinText:        stdinText,
+		stdout:           stdout,
+		stderr:           c.stderr,
+	}
+	value, err := accessService.RunScript(ctx, name, args, nil)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return output.JSON(stdout, map[string]any{
+			"script": name,
+			"args":   args,
+			"result": value,
+		})
+	}
+	if ok, err := renderAskOutput(stdout, value); ok || err != nil {
+		return err
+	}
+	if text := askResponseText(value); strings.TrimSpace(text) != "" {
+		_, err := fmt.Fprintln(stdout, text)
+		return err
+	}
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		_, err := fmt.Fprintln(stdout, typed)
+		return err
+	case map[string]any:
+		return printMap(stdout, typed)
+	default:
+		return output.JSON(stdout, value)
+	}
+}
+
 func (c command) dukaone(ctx context.Context, cfg *config.Config, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: hubhq dukaone discover [broadcast-address] | list | add | add <device-id> <name> [ip-address] [room] | rename <name-or-id> <new-name> | room <name-or-id> <room> | remove <name-or-id> [--yes]")
@@ -527,6 +758,22 @@ func (c command) dukaone(ctx context.Context, cfg *config.Config, args []string,
 		items, err := dukaone.Discover(ctx, cfg, broadcast, 2)
 		if err != nil {
 			return err
+		}
+		if configured, configuredErr := dukaone.List(ctx, cfg); configuredErr == nil && len(configured) > 0 {
+			configuredByID := map[string]map[string]any{}
+			for _, item := range configured {
+				configuredByID[stringValue(mapLookup(item, "dukaone", "deviceId"))] = item
+				configuredByID[idOf(item)] = item
+			}
+			for i, item := range items {
+				if replacement, ok := configuredByID[stringValue(mapLookup(item, "dukaone", "deviceId"))]; ok {
+					items[i] = replacement
+					continue
+				}
+				if replacement, ok := configuredByID[idOf(item)]; ok {
+					items[i] = replacement
+				}
+			}
 		}
 		if c.json {
 			return output.JSON(stdout, items)
@@ -744,7 +991,7 @@ func (c command) auth(ctx context.Context, cfg *config.Config, stdin io.Reader, 
 	} else {
 		hubs, err := discovery.Find(ctx, 5*time.Second)
 		if err != nil {
-			return fmt.Errorf("%w; try `hubhq auth --host <hub-ip>` if mDNS discovery is not working on your network", err)
+			return fmt.Errorf("%w; try `hubhq hub auth --host <hub-ip>` if mDNS discovery is not working on your network", err)
 		}
 		hub, err = chooseHub(stdin, stdout, hubs)
 		if err != nil {
@@ -830,6 +1077,9 @@ func (c command) hub(ctx context.Context, cfg *config.Config, args []string, std
 		}
 		return probeHub(ctx, args[1], stdout)
 	}
+	if len(args) > 0 && args[0] == "auth" {
+		return c.auth(ctx, cfg, c.stdin, stdout)
+	}
 	if len(args) > 0 && args[0] == "import-token" {
 		if len(args) < 3 {
 			return errors.New("usage: hubhq hub import-token <host> <token>")
@@ -855,7 +1105,7 @@ func (c command) hub(ctx context.Context, cfg *config.Config, args []string, std
 		if len(hubs) == 0 {
 			discovered, err := discovery.Find(ctx, 3*time.Second)
 			if err != nil {
-				return fmt.Errorf("%w; try `hubhq auth --host <hub-ip>` or `hubhq hub probe <hub-ip>`", err)
+				return fmt.Errorf("%w; try `hubhq hub auth --host <hub-ip>` or `hubhq hub probe <hub-ip>`", err)
 			}
 			if c.json {
 				return output.JSON(stdout, discovered)
@@ -1018,7 +1268,15 @@ func (c command) scenes(ctx context.Context, cfg *config.Config, args []string, 
 	}
 }
 
-func (c command) watch(ctx context.Context, cfg *config.Config, stdout io.Writer) error {
+func (c command) watch(ctx context.Context, cfg *config.Config, args []string, stdout io.Writer) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "restart":
+			return c.restartRuntimeInstances(stdout)
+		default:
+			return fmt.Errorf("unknown watch command %q", args[0])
+		}
+	}
 	status, err := startRuntimeStatusServer(ctx, "watch", c.statusPort)
 	if err == nil {
 		runtimeLogf(stdout, status, "watch status available at %s", status.URL())
@@ -1043,6 +1301,15 @@ func (c command) watch(ctx context.Context, cfg *config.Config, stdout io.Writer
 				})
 			}
 		}
+	instance, err := buildRuntimeInstanceInfo("watch", activeCfg, status)
+	if err != nil {
+		return err
+	}
+	coord, err := newClusterRegistry(runCtx, instance)
+	if err != nil {
+		return err
+	}
+		defer coord.Close()
 		return cli.Watch(runCtx, func(raw json.RawMessage) error {
 			if status != nil {
 				status.Add("watch event: " + string(raw))
@@ -1310,36 +1577,40 @@ func (c command) runSpeakerPlayTargets(ctx context.Context, cfg *config.Config, 
 	if len(targets) == 0 {
 		return errors.New("no speakers found")
 	}
+	resolvedSource, err := resolveSpeakerMediaSource(cfg, source)
+	if err != nil {
+		return err
+	}
 	sourceKind := "file"
-	if looksLikeURL(source) {
+	if looksLikeURL(resolvedSource) {
 		sourceKind = "url"
 	}
 	names := make([]string, 0, len(targets))
 	for _, target := range targets {
 		names = append(names, target.Name)
-		c.debugf("speaker play: executing source=%q source_kind=%s target=%s kind=%s playback=%s", source, sourceKind, target.Name, target.Kind, target.Playback)
+		c.debugf("speaker play: executing source=%q resolved_source=%q source_kind=%s target=%s kind=%s playback=%s", source, resolvedSource, sourceKind, target.Name, target.Kind, target.Playback)
 		switch target.Kind {
 		case "local":
 			c.debugf("speaker play: starting local media playback for %s", target.Name)
-			if err := playLocalMedia(ctx, source); err != nil {
+			if err := playLocalMedia(ctx, resolvedSource); err != nil {
 				return err
 			}
 			c.debugf("speaker play: local media playback finished for %s", target.Name)
 		case "cast":
-			c.debugf("speaker play: cast target host=%s port=%d source=%s", target.CastDevice.Host, target.CastDevice.Port, source)
-			if err := castbackend.PlayFile(ctx, target.CastDevice, source, c.debug); err != nil {
+			c.debugf("speaker play: cast target host=%s port=%d source=%s", target.CastDevice.Host, target.CastDevice.Port, resolvedSource)
+			if err := castbackend.PlayFile(ctx, target.CastDevice, resolvedSource, c.debug); err != nil {
 				return err
 			}
 			c.debugf("speaker play: cast playback finished for %s", target.Name)
 		case "airplay":
-			if looksLikeURL(source) {
-				c.debugf("speaker play: airplay url host=%s source=%s", target.AirPlay.Host, source)
-				if err := airplay.PlayURL(ctx, target.AirPlay, source, cfg.Apple); err != nil {
+			if looksLikeURL(resolvedSource) {
+				c.debugf("speaker play: airplay url host=%s source=%s", target.AirPlay.Host, resolvedSource)
+				if err := airplay.PlayURL(ctx, target.AirPlay, resolvedSource, cfg.Apple); err != nil {
 					return err
 				}
 			} else {
-				c.debugf("speaker play: airplay file host=%s source=%s", target.AirPlay.Host, source)
-				if err := airplay.PlayFile(ctx, target.AirPlay, source, cfg.Apple); err != nil {
+				c.debugf("speaker play: airplay file host=%s source=%s", target.AirPlay.Host, resolvedSource)
+				if err := airplay.PlayFile(ctx, target.AirPlay, resolvedSource, cfg.Apple); err != nil {
 					return err
 				}
 			}
@@ -1354,11 +1625,11 @@ func (c command) runSpeakerPlayTargets(ctx context.Context, cfg *config.Config, 
 	if c.json {
 		return output.JSON(stdout, map[string]any{
 			"speakers": names,
-			"source":   source,
+			"source":   resolvedSource,
 			"status":   "played",
 		})
 	}
-	_, err := fmt.Fprintf(stdout, "playing %s on %s\n", source, strings.Join(names, ", "))
+	_, err = fmt.Fprintf(stdout, "playing %s on %s\n", resolvedSource, strings.Join(names, ", "))
 	return err
 }
 
@@ -1628,13 +1899,22 @@ func askResponseText(value any) string {
 
 func (c command) auto(ctx context.Context, cfg *config.Config, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New(`usage: hubhq auto "turn on hallway at sunset" | list | show <id> | apply <id> | delete <id>`)
+		return errors.New(`usage: hubhq auto add "turn on hallway at sunset" | list | status | restart | show <id> | apply <id> | delete <id>`)
 	}
 	switch args[0] {
+	case "add":
+		if len(args) < 2 {
+			return errors.New(`usage: hubhq auto add "turn on hallway at sunset"`)
+		}
+		return c.autoAdd(ctx, cfg, strings.Join(args[1:], " "), stdout)
 	case "list":
 		return c.autoList(stdout)
 	case "run":
 		return c.autoRun(ctx, cfg, stdout)
+	case "status":
+		return c.autoStatus(stdout)
+	case "restart":
+		return c.restartRuntimeInstances(stdout)
 	case "test":
 		if len(args) < 2 {
 			return errors.New("usage: hubhq auto test <id>")
@@ -1656,72 +1936,75 @@ func (c command) auto(ctx context.Context, cfg *config.Config, args []string, st
 		}
 		return c.autoDelete(args[1], stdout)
 	default:
-		prompt := strings.Join(args, " ")
-		c.debugf("auto: initializing LLM provider")
-		provider, err := llm.NewProvider(cfg.LLM)
-		if err != nil {
-			return err
-		}
-		if logger, ok := provider.(llm.DebugLogger); ok {
-			logger.SetDebugLogger(c.debugf)
-		}
-		c.debugf("auto: collecting inventory home context")
-		homeCtx, err := collectHomeContext(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		c.debugf("auto: collected %d devices and %d scenes", len(homeCtx.Devices), len(homeCtx.Scenes))
-		c.debugf("auto: requesting automation script for prompt %q", prompt)
-		autoScript, err := provider.GenerateAutomationScript(ctx, prompt, homeCtx)
-		if err != nil {
-			return err
-		}
-		c.debugJSON("auto script", autoScript)
-		if c.showScript && strings.TrimSpace(autoScript.Script.Source) != "" {
-			if _, err := fmt.Fprintf(stdout, "%s\n", autoScript.Script.Source); err != nil {
-				return err
-			}
-		}
-		c.debugScript("auto script source", autoScript.Script.Source)
-		id, err := autos.NewID()
-		if err != nil {
-			return err
-		}
-		spec := automationScriptToSpec(autoScript)
-		spec.ID = id
-		spec.Prompt = prompt
-		if spec.ApplySupport == "" {
-			spec.ApplySupport = "unsupported"
-		}
-		if strings.TrimSpace(spec.Script.Source) != "" && strings.EqualFold(spec.ApplySupport, "supported") {
-			spec.Status = "applied"
-		} else {
-			spec.Status = "pending_review"
-		}
-		now := time.Now().UTC()
-		spec.CreatedAt = now
-		spec.LastUpdatedAt = now
+		return fmt.Errorf("unknown auto command %q", args[0])
+	}
+}
 
-		store, _, err := autos.Load()
-		if err != nil {
-			return err
-		}
-		store.Upsert(spec)
-		if err := autos.Save(store); err != nil {
-			return err
-		}
-		c.debugf("auto: saved spec %s with apply support %s", spec.ID, spec.ApplySupport)
-
-		if c.json {
-			return output.JSON(stdout, spec)
-		}
-		if spec.Status == "applied" {
-			_, err = fmt.Fprintf(stdout, "saved and activated auto spec %s: %s\n", spec.ID, spec.Summary)
-		} else {
-			_, err = fmt.Fprintf(stdout, "saved auto spec %s: %s\n", spec.ID, spec.Summary)
-		}
+func (c command) autoAdd(ctx context.Context, cfg *config.Config, prompt string, stdout io.Writer) error {
+	c.debugf("auto: initializing LLM provider")
+	provider, err := llm.NewProvider(cfg.LLM)
+	if err != nil {
 		return err
 	}
+	if logger, ok := provider.(llm.DebugLogger); ok {
+		logger.SetDebugLogger(c.debugf)
+	}
+	c.debugf("auto: collecting inventory home context")
+	homeCtx, err := collectHomeContext(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	c.debugf("auto: collected %d devices and %d scenes", len(homeCtx.Devices), len(homeCtx.Scenes))
+	c.debugf("auto: requesting automation script for prompt %q", prompt)
+	autoScript, err := provider.GenerateAutomationScript(ctx, prompt, homeCtx)
+	if err != nil {
+		return err
+	}
+	c.debugJSON("auto script", autoScript)
+	if c.showScript && strings.TrimSpace(autoScript.Script.Source) != "" {
+		if _, err := fmt.Fprintf(stdout, "%s\n", autoScript.Script.Source); err != nil {
+			return err
+		}
+	}
+	c.debugScript("auto script source", autoScript.Script.Source)
+	id, err := autos.NewID()
+	if err != nil {
+		return err
+	}
+	spec := automationScriptToSpec(autoScript)
+	spec.ID = id
+	spec.Prompt = prompt
+	if spec.ApplySupport == "" {
+		spec.ApplySupport = "unsupported"
+	}
+	if strings.TrimSpace(spec.Script.Source) != "" && strings.EqualFold(spec.ApplySupport, "supported") {
+		spec.Status = "applied"
+	} else {
+		spec.Status = "pending_review"
+	}
+	now := time.Now().UTC()
+	spec.CreatedAt = now
+	spec.LastUpdatedAt = now
+
+	store, _, err := autos.Load()
+	if err != nil {
+		return err
+	}
+	store.Upsert(spec)
+	if err := autos.Save(store); err != nil {
+		return err
+	}
+	c.debugf("auto: saved spec %s with apply support %s", spec.ID, spec.ApplySupport)
+
+	if c.json {
+		return output.JSON(stdout, spec)
+	}
+	if spec.Status == "applied" {
+		_, err = fmt.Fprintf(stdout, "saved and activated auto spec %s: %s\n", spec.ID, spec.Summary)
+	} else {
+		_, err = fmt.Fprintf(stdout, "saved auto spec %s: %s\n", spec.ID, spec.Summary)
+	}
+	return err
 }
 
 func (c command) devicesList(ctx context.Context, cfg *config.Config, stdout io.Writer) error {
@@ -2174,13 +2457,19 @@ func (c command) autoRun(ctx context.Context, cfg *config.Config, stdout io.Writ
 			}
 		}
 	}
+	instance, err := buildRuntimeInstanceInfo("auto-run", cfg, status)
+	if err != nil {
+		return err
+	}
+	coord, err := newClusterRegistry(ctx, instance)
+	if err != nil {
+		return err
+	}
+	defer coord.Close()
+	if _, err := coord.Refresh(ctx, 1500*time.Millisecond); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		c.debugf("cluster refresh failed: %v", err)
+	}
 	return c.runWithRuntimeFileReload(ctx, cfg, stdout, status, func(runCtx context.Context, activeCfg *config.Config) error {
-		lock, err := acquireAutoRunLock(activeCfg)
-		if err != nil {
-			return err
-		}
-		defer lock.Release()
-		c.debugf("auto run: acquired hub lock %s", lock.path)
 		cli, err := hubClient(activeCfg)
 		if err != nil {
 			return err
@@ -2203,6 +2492,12 @@ func (c command) autoRun(ctx context.Context, cfg *config.Config, stdout io.Writ
 			}
 			for _, spec := range store.SortedSpecs() {
 				if !autoSpecIsRunnerActive(spec) || strings.TrimSpace(spec.Script.Source) == "" {
+					continue
+				}
+				if !coord.IsLeader("auto-run") {
+					if c.debug {
+						c.debugf("auto run: spec %s skipped: cluster leader is %s", spec.ID, coord.LeaderName("auto-run"))
+					}
 					continue
 				}
 				match, reason := autoEventMatches(spec, payload)
@@ -2271,93 +2566,114 @@ func (c command) autoRun(ctx context.Context, cfg *config.Config, stdout io.Writ
 	})
 }
 
-func acquireAutoRunLock(cfg *config.Config) (*autoRunLock, error) {
-	hub, err := cfg.DefaultHubConfig()
+func (c command) autoStatus(stdout io.Writer) error {
+	instances, err := queryClusterInstances(context.Background(), 3*time.Second)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	appDir, err := config.AppDir()
-	if err != nil {
-		return nil, err
+	if c.json {
+		return output.JSON(stdout, map[string]any{
+			"instances": instances,
+		})
 	}
-	if err := os.MkdirAll(appDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create app dir for auto run lock: %w", err)
+	if len(instances) == 0 {
+		_, err := fmt.Fprintln(stdout, "no running hubhq instances found on the LAN")
+		return err
 	}
-	lockPath := filepath.Join(appDir, fmt.Sprintf("auto-run-%s.lock", sanitizeHostID(firstNonEmpty(hub.ID, hub.Host))))
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open auto run lock: %w", err)
-	}
-	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		info := readAutoRunLockInfo(file)
-		_ = file.Close()
-		if info != nil {
-			return nil, fmt.Errorf("another auto run is already active for hub %s (%s); pid=%d host=%s started_at=%s", firstNonEmpty(hub.Name, hub.ID), hub.Host, info.PID, info.Host, info.StartedAt.Format(time.RFC3339))
+	rows := make([][]string, 0, len(instances))
+	leaderByGroup := clusterLeaderByGroup(instances)
+	for _, instance := range instances {
+		role := "standby"
+		if leaderByGroup[clusterGroupKey(instance.Info)] == instance.Info.ID {
+			role = "leader"
 		}
-		return nil, fmt.Errorf("another auto run is already active for hub %s (%s)", firstNonEmpty(hub.Name, hub.ID), hub.Host)
+		rows = append(rows, []string{
+			instance.Info.Mode,
+			role,
+			instance.Info.Host,
+			strconv.Itoa(instance.Info.PID),
+			clusterInstanceStatus(instance),
+			instance.Info.HubHost,
+			instance.Info.StatusURL,
+			instance.Info.StartedAt.Format(time.RFC3339),
+		})
 	}
-	if err := file.Truncate(0); err != nil {
-		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("truncate auto run lock: %w", err)
-	}
-	if _, err := file.Seek(0, 0); err != nil {
-		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("seek auto run lock: %w", err)
-	}
-	host, _ := os.Hostname()
-	info := autoRunLockInfo{
-		PID:       os.Getpid(),
-		Host:      host,
-		StartedAt: time.Now().UTC(),
-		HubID:     hub.ID,
-		HubHost:   hub.Host,
-	}
-	data, err := json.MarshalIndent(info, "", "  ")
+	return output.Table(stdout, []string{"MODE", "ROLE", "HOST", "PID", "STATUS", "HUB", "URL", "STARTED"}, rows)
+}
+
+func (c command) restartRuntimeInstances(stdout io.Writer) error {
+	instances, err := queryClusterInstances(context.Background(), 3*time.Second)
 	if err != nil {
-		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("marshal auto run lock: %w", err)
+		return err
 	}
-	data = append(data, '\n')
-	if _, err := file.Write(data); err != nil {
-		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("write auto run lock: %w", err)
+	if len(instances) == 0 {
+		_, err := fmt.Fprintln(stdout, "no running hubhq instances found on the LAN")
+		return err
 	}
-	if err := file.Sync(); err != nil {
-		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("sync auto run lock: %w", err)
+	restarted := 0
+	for _, instance := range instances {
+		name := firstNonEmpty(instance.Info.Mode, "hubhq")
+		host := firstNonEmpty(instance.Info.Host, instance.Info.HubHost, instance.Info.ID)
+		if err := postInstanceRestart(context.Background(), instance.Info.StatusURL); err != nil {
+			_, _ = fmt.Fprintf(stdout, "not restarted: %s host=%s pid=%d: %v\n", name, host, instance.Info.PID, err)
+			continue
+		}
+		restarted++
+		_, _ = fmt.Fprintf(stdout, "restarted: %s host=%s pid=%d\n", name, host, instance.Info.PID)
 	}
-	return &autoRunLock{file: file, path: lockPath}, nil
+	if restarted == 0 {
+		_, err := fmt.Fprintln(stdout, "no running hubhq instances were restarted")
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "restarted %d hubhq instance(s)\n", restarted)
+	return err
 }
 
-func readAutoRunLockInfo(file *os.File) *autoRunLockInfo {
-	if file == nil {
-		return nil
+func postInstanceRestart(ctx context.Context, statusURL string) error {
+	statusURL = strings.TrimSpace(statusURL)
+	if statusURL == "" {
+		return fmt.Errorf("instance does not advertise a status URL")
 	}
-	if _, err := file.Seek(0, 0); err != nil {
-		return nil
+	restartURL := strings.TrimRight(statusURL, "/") + "/restart"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, restartURL, nil)
+	if err != nil {
+		return err
 	}
-	data, err := io.ReadAll(file)
-	if err != nil || len(bytes.TrimSpace(data)) == 0 {
-		return nil
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
 	}
-	var info autoRunLockInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("restart request returned %s", resp.Status)
 	}
-	return &info
+	return nil
 }
 
-func (l *autoRunLock) Release() {
-	if l == nil || l.file == nil {
-		return
+func buildRuntimeInstanceInfo(mode string, cfg *config.Config, status *runtimeStatusServer) (runtimeInstanceInfo, error) {
+	now := time.Now().UTC()
+	host, _ := os.Hostname()
+	info := runtimeInstanceInfo{
+		ID:        fmt.Sprintf("%s-%d-%d", sanitizeHostID(firstNonEmpty(host, mode)), os.Getpid(), now.UnixNano()),
+		Mode:      mode,
+		PID:       os.Getpid(),
+		StartedAt: now,
+		StatusURL: "",
+		Command:   strings.Join(os.Args, " "),
+		Args:      append([]string(nil), os.Args...),
 	}
-	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
-	_ = l.file.Close()
+	info.Host = host
+	if status != nil {
+		info.StatusURL = status.URL()
+	}
+	if hub, err := cfg.DefaultHubConfig(); err == nil {
+		info.HubID = hub.ID
+		info.HubName = hub.Name
+		info.HubHost = hub.Host
+		info.HubKey = firstNonEmpty(hub.ID, hub.Host)
+	}
+	return info, nil
 }
 
 func (c command) runWithRuntimeFileReload(ctx context.Context, cfg *config.Config, stdout io.Writer, status *runtimeStatusServer, run func(context.Context, *config.Config) error) error {
@@ -2682,15 +2998,39 @@ func (c command) executeAutomationScript(ctx context.Context, cfg *config.Config
 		inventoryScenes:  homeCtx.Scenes,
 		speakerTargets:   speakerTargets,
 	}
+	speakerService := runtimeSpeakerService{cmd: c, cfg: cfg, async: true}
+	stateStore := newRuntimeStateStore()
+	httpClient := runtimeHTTPClient{}
+	toolService := runtimeToolService{cfg: cfg}
+	logger := runtimeLogger{cmd: c}
+	accessService := runtimeAccessService{
+		cmd:              c,
+		cfg:              cfg,
+		devices:          deviceService,
+		deviceSnapshots:  homeCtx.Devices,
+		sceneSnapshots:   homeCtx.Scenes,
+		speakers:         speakerService,
+		speakerSnapshots: speakerSnapshotsFromHomeContext(homeCtx),
+		state:            stateStore,
+		http:             httpClient,
+		tools:            toolService,
+		logger:           logger,
+		now:              time.Now,
+		stdout:           io.Discard,
+		stderr:           c.stderr,
+	}
 	c.debugf("auto run: executing script for spec %s via runtime %s timeout=%ds", spec.ID, spec.Script.Runtime, timeoutSeconds)
 	result, err := engine.Execute(scriptCtx, script.ExecContext{
 		Devices:          deviceService,
 		DevicesSnapshot:  homeCtx.Devices,
 		ScenesSnapshot:   homeCtx.Scenes,
-		Speakers:         runtimeSpeakerService{cmd: c, cfg: cfg, async: true},
+		Speakers:         speakerService,
 		SpeakersSnapshot: speakerSnapshotsFromHomeContext(homeCtx),
-		State:            newRuntimeStateStore(),
-		Logger:           runtimeLogger{cmd: c},
+		State:            stateStore,
+		HTTP:             httpClient,
+		Tools:            toolService,
+		Access:           accessService,
+		Logger:           logger,
 		Now:              time.Now,
 	}, spec.Script)
 	if err != nil {
@@ -3120,15 +3460,25 @@ func valuesEqual(left, right any) bool {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `hubhq
 
-Commands:
-  auth                     Pair with a discovered hub and store credentials
-  auth --host <host>       Pair directly with a hub IP/hostname
+Setup:
+  hub auth                 Pair with a discovered hub and store credentials
+  hub auth --host <host>   Pair directly with a hub IP/hostname
   hub list                 Show configured hubs from local config
   hub discover             Run live hub discovery on the current network
   hub probe <host>         Check TCP reachability to a hub on port 8443
   hub import-token <host> <token>
+
+Config:
+  config show              Show the full saved CLI configuration
   config get <key>         Read a saved CLI config value
   config set <key> <value> Save a CLI config value
+
+Access:
+  access show              Show resolved access directories
+  access init              Create access/, data/, html/, sounds/, scripts/, skills/, tools/
+  access run <script>      Run a JavaScript file from access/scripts
+
+Ventilation:
   dukaone discover [broadcast-address]
                            Discover DukaOne ventilation devices on the network
   dukaone add              Discover and add all DukaOne devices on the network
@@ -3137,38 +3487,52 @@ Commands:
   dukaone rename <name-or-id> <new-name>
   dukaone room <name-or-id> <room>
   dukaone remove <name-or-id> --yes
-  speaker list             List speakers found on the local machine and network
-  speaker play <source>    Play a file, URL, or built-in sound-0..sound-5 on the local computer speaker
-  speaker play <source> <name>
-                           Play on the named speaker, a comma-separated speaker list, or speaker-all
-  ask "<prompt>"           Execute non-destructive natural-language actions
-  auto "<prompt>"          Create and store a reviewable automation spec
-  auto list
-  auto run
-  auto test <id>
-  auto show <id>
-  auto apply <id>
-  auto delete <id>
-  refresh                  Refresh local cache of devices and scenes
-  dump                     Print the full home payload as JSON
+
+Devices:
   devices list             List devices
   devices get <name-or-id>
   devices set <name-or-id> key=value...
   devices rename <name-or-id> <new-name>
   devices delete <name-or-id> --yes
+
+Scenes:
   scenes list
   scenes get <name-or-id>
   scenes trigger <name-or-id>
   scenes rename <name-or-id> <new-name>
   scenes delete <name-or-id> --yes
+
+Media:
+  speaker list             List speakers found on the local machine and network
+  speaker play <source>    Play a file, URL, access/sounds file, or built-in sound-0..sound-5 on the local computer speaker
+  speaker play <source> <name>
+                           Play on the named speaker, a comma-separated speaker list, or speaker-all
+
+Automation:
+  ask "<prompt>"           Execute non-destructive natural-language actions
+  auto add "<prompt>"      Create and store a reviewable automation spec
+  auto list
+  auto status              Show running hubhq instances across the LAN
+  auto restart             Restart running hubhq instances across the LAN
+  auto run
+  auto test <id>
+  auto show <id>
+  auto apply <id>
+  auto delete <id>
+
+Utility:
+  refresh                  Refresh local cache of devices and scenes
+  dump                     Print the full home payload as JSON
   watch                    Stream update events
+  watch restart            Restart running hubhq instances across the LAN
 
 Flags:
+  --version                Print the current hubhq version
   --json                   JSON output
   --yes                    Confirm destructive actions
   --debug                  Print step-level diagnostics for pairing, ask, and auto
   --show-script            Print generated script source before normal output
-  --host <host>            Override hub discovery for auth or target a speaker host directly
+  --host <host>            Override hub discovery for hub auth or target a speaker host directly
   --status-port <port>     Set the browser status server port for watch and auto run (default: 8080)`)
 }
 
@@ -3790,14 +4154,36 @@ func (c command) executeAskScript(ctx context.Context, cfg *config.Config, homeC
 		inventoryDevices: homeCtx.Devices,
 		inventoryScenes:  homeCtx.Scenes,
 	}
+	speakerService := runtimeSpeakerService{cmd: c, cfg: cfg, targets: speakerTargets}
+	stateStore := newRuntimeStateStore()
+	httpClient := runtimeHTTPClient{}
+	toolService := runtimeToolService{cfg: cfg}
+	logger := runtimeLogger{cmd: c}
+	accessService := runtimeAccessService{
+		cmd:              c,
+		cfg:              cfg,
+		devices:          deviceService,
+		deviceSnapshots:  homeCtx.Devices,
+		sceneSnapshots:   homeCtx.Scenes,
+		speakers:         speakerService,
+		speakerSnapshots: speakerSnapshotsFromHomeContext(homeCtx),
+		state:            stateStore,
+		http:             httpClient,
+		tools:            toolService,
+		logger:           logger,
+		now:              time.Now,
+	}
 	result, err := engine.Execute(ctx, script.ExecContext{
 		Devices:          deviceService,
 		DevicesSnapshot:  homeCtx.Devices,
 		ScenesSnapshot:   homeCtx.Scenes,
-		Speakers:         runtimeSpeakerService{cmd: c, cfg: cfg, targets: speakerTargets},
+		Speakers:         speakerService,
 		SpeakersSnapshot: speakerSnapshotsFromHomeContext(homeCtx),
-		State:            newRuntimeStateStore(),
-		Logger:           runtimeLogger{cmd: c},
+		State:            stateStore,
+		HTTP:             httpClient,
+		Tools:            toolService,
+		Access:           accessService,
+		Logger:           logger,
 		Now:              time.Now,
 	}, doc.Script)
 	if err != nil {
@@ -4295,6 +4681,30 @@ type runtimeLogger struct {
 	cmd command
 }
 
+type runtimeHTTPClient struct{}
+
+type runtimeToolService struct {
+	cfg *config.Config
+}
+
+type runtimeAccessService struct {
+	cmd              command
+	cfg              *config.Config
+	devices          script.DeviceService
+	deviceSnapshots  []map[string]any
+	sceneSnapshots   []map[string]any
+	speakers         script.SpeakerService
+	speakerSnapshots []map[string]any
+	state            script.StateStore
+	http             script.HTTPClient
+	tools            script.ToolService
+	logger           script.Logger
+	now              func() time.Time
+	stdinText        string
+	stdout           io.Writer
+	stderr           io.Writer
+}
+
 type runtimeSpeakerService struct {
 	cmd     command
 	cfg     *config.Config
@@ -4425,6 +4835,416 @@ func (r runtimeSpeakerService) playTargets(ctx context.Context, sound string, ta
 
 func (r runtimeLogger) Printf(format string, args ...any) {
 	r.cmd.debugf("script: "+format, args...)
+}
+
+func (runtimeHTTPClient) Do(ctx context.Context, method, url string, body any, headers map[string]string) (map[string]any, error) {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead:
+	default:
+		return nil, fmt.Errorf("unsupported http method %q", method)
+	}
+	parsed, err := neturl.Parse(strings.TrimSpace(url))
+	if err != nil {
+		return nil, fmt.Errorf("parse url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported url scheme %q", parsed.Scheme)
+	}
+
+	var reader io.Reader
+	switch value := body.(type) {
+	case nil:
+	case string:
+		reader = strings.NewReader(value)
+	case []byte:
+		reader = bytes.NewReader(value)
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("encode http body: %w", err)
+		}
+		reader = bytes.NewReader(data)
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		if strings.TrimSpace(headers["Content-Type"]) == "" {
+			headers["Content-Type"] = "application/json"
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, parsed.String(), reader)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	for key, value := range headers {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("perform request: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	headerMap := map[string]any{}
+	for key, values := range resp.Header {
+		if len(values) == 1 {
+			headerMap[key] = values[0]
+			continue
+		}
+		items := make([]any, 0, len(values))
+		for _, value := range values {
+			items = append(items, value)
+		}
+		headerMap[key] = items
+	}
+	result := map[string]any{
+		"url":         parsed.String(),
+		"method":      method,
+		"ok":          resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status":      resp.StatusCode,
+		"status_text": resp.Status,
+		"headers":     headerMap,
+		"body_text":   string(raw),
+	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if strings.Contains(contentType, "application/json") {
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err == nil {
+			result["json"] = decoded
+		}
+	}
+	return result, nil
+}
+
+func (r runtimeToolService) Run(ctx context.Context, name string, args []string, stdin string, timeoutSeconds int) (map[string]any, error) {
+	path, err := r.resolveTool(name)
+	if err != nil {
+		return nil, err
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 30
+	}
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, path, args...)
+	cmd.Dir = filepath.Dir(path)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	started := time.Now()
+	err = cmd.Run()
+	durationMS := time.Since(started).Milliseconds()
+	exitCode := 0
+	ok := true
+	if err != nil {
+		ok = false
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			exitCode = -1
+		} else {
+			return nil, fmt.Errorf("run tool %s: %w", path, err)
+		}
+	}
+	return map[string]any{
+		"ok":          ok,
+		"exit_code":   exitCode,
+		"stdout":      stdout.String(),
+		"stderr":      stderr.String(),
+		"command":     path,
+		"args":        args,
+		"duration_ms": durationMS,
+	}, nil
+}
+
+func (r runtimeToolService) resolveTool(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("tool name is required")
+	}
+	if err := config.EnsureAccessLayout(r.cfg); err != nil {
+		return "", err
+	}
+	base, err := config.AccessToolsDir(r.cfg)
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("absolute tool paths are not allowed: %s", name)
+	}
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tool path escapes tools scope: %s", name)
+	}
+	resolved := filepath.Join(base, clean)
+	baseClean := filepath.Clean(base)
+	resolvedClean := filepath.Clean(resolved)
+	if resolvedClean != baseClean && !strings.HasPrefix(resolvedClean, baseClean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tool path escapes tools scope: %s", name)
+	}
+	info, err := os.Stat(resolvedClean)
+	if err != nil {
+		return "", fmt.Errorf("stat tool path %s: %w", resolvedClean, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("tool path is a directory: %s", name)
+	}
+	if info.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("tool is not executable: %s", name)
+	}
+	return resolvedClean, nil
+}
+
+func (r runtimeAccessService) Root(ctx context.Context) (string, error) {
+	_ = ctx
+	if err := config.EnsureAccessLayout(r.cfg); err != nil {
+		return "", err
+	}
+	return config.AccessRoot(r.cfg)
+}
+
+func (r runtimeAccessService) List(ctx context.Context, scope, path string) ([]map[string]any, error) {
+	_ = ctx
+	dir, err := r.resolve(scope, path, true)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("list access path %s: %w", dir, err)
+	}
+	items := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat access path %s: %w", entry.Name(), err)
+		}
+		items = append(items, map[string]any{
+			"name":     entry.Name(),
+			"is_dir":   entry.IsDir(),
+			"size":     info.Size(),
+			"mod_time": info.ModTime().UTC().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return strings.ToLower(stringValue(items[i]["name"])) < strings.ToLower(stringValue(items[j]["name"]))
+	})
+	return items, nil
+}
+
+func (r runtimeAccessService) ReadText(ctx context.Context, scope, path string) (string, error) {
+	_ = ctx
+	resolved, err := r.resolve(scope, path, false)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", fmt.Errorf("read access file %s: %w", resolved, err)
+	}
+	return string(data), nil
+}
+
+func (r runtimeAccessService) WriteText(ctx context.Context, scope, path, value string) error {
+	_ = ctx
+	resolved, err := r.resolve(scope, path, false)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+		return fmt.Errorf("create access parent dir: %w", err)
+	}
+	if err := os.WriteFile(resolved, []byte(value), 0o644); err != nil {
+		return fmt.Errorf("write access file %s: %w", resolved, err)
+	}
+	return nil
+}
+
+func (r runtimeAccessService) ReadJSON(ctx context.Context, scope, path string) (any, error) {
+	value, err := r.ReadText(ctx, scope, path)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return nil, fmt.Errorf("decode access json %s/%s: %w", scope, path, err)
+	}
+	return decoded, nil
+}
+
+func (r runtimeAccessService) WriteJSON(ctx context.Context, scope, path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal access json %s/%s: %w", scope, path, err)
+	}
+	data = append(data, '\n')
+	return r.WriteText(ctx, scope, path, string(data))
+}
+
+func (r runtimeAccessService) Delete(ctx context.Context, scope, path string) error {
+	_ = ctx
+	resolved, err := r.resolve(scope, path, false)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(resolved); err != nil {
+		return fmt.Errorf("delete access path %s: %w", resolved, err)
+	}
+	return nil
+}
+
+func (r runtimeAccessService) ListScripts(ctx context.Context) ([]map[string]any, error) {
+	return r.List(ctx, "scripts", ".")
+}
+
+func (r runtimeAccessService) RunScript(ctx context.Context, name string, args []string, input any) (any, error) {
+	path, err := r.resolveScriptName(name)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read access script %s: %w", path, err)
+	}
+	doc := script.Document{
+		Language:   script.LanguageJavaScript,
+		Runtime:    script.RuntimeGoja,
+		EntryPoint: "main",
+		Source:     string(data),
+	}
+	engine, err := script.NewEngine(doc)
+	if err != nil {
+		return nil, err
+	}
+	execCtx := script.ExecContext{
+		Devices:          r.devices,
+		DevicesSnapshot:  r.deviceSnapshots,
+		ScenesSnapshot:   r.sceneSnapshots,
+		Speakers:         r.speakers,
+		SpeakersSnapshot: r.speakerSnapshots,
+		State:            r.state,
+		HTTP:             r.http,
+		Tools:            r.tools,
+		Logger:           r.logger,
+		Now:              r.now,
+		ScriptArgs:       args,
+		ScriptInput:      input,
+		StdinText:        r.stdinText,
+		Stdout:           r.stdout,
+		Stderr:           r.stderr,
+	}
+	access := runtimeAccessService{
+		cmd:              r.cmd,
+		cfg:              r.cfg,
+		devices:          r.devices,
+		deviceSnapshots:  r.deviceSnapshots,
+		sceneSnapshots:   r.sceneSnapshots,
+		speakers:         r.speakers,
+		speakerSnapshots: r.speakerSnapshots,
+		state:            r.state,
+		http:             r.http,
+		tools:            r.tools,
+		logger:           r.logger,
+		now:              r.now,
+		stdinText:        r.stdinText,
+		stdout:           r.stdout,
+		stderr:           r.stderr,
+	}
+	execCtx.Access = access
+	result, err := engine.Execute(ctx, execCtx, doc)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if r.logger != nil {
+		for _, line := range result.Logs {
+			r.logger.Printf("%s", line)
+		}
+	}
+	return result.Output, nil
+}
+
+func (r runtimeAccessService) resolve(scope, rel string, allowDir bool) (string, error) {
+	if err := config.EnsureAccessLayout(r.cfg); err != nil {
+		return "", err
+	}
+	var base string
+	var err error
+	switch strings.TrimSpace(strings.ToLower(scope)) {
+	case "data":
+		base, err = config.AccessDataDir(r.cfg)
+	case "html":
+		base, err = config.AccessHTMLDir(r.cfg)
+	case "sounds":
+		base, err = config.AccessSoundsDir(r.cfg)
+	case "scripts":
+		base, err = config.AccessScriptsDir(r.cfg)
+	case "skills":
+		base, err = config.AccessSkillsDir(r.cfg)
+	case "tools":
+		base, err = config.AccessToolsDir(r.cfg)
+	default:
+		return "", fmt.Errorf("unsupported access scope %q", scope)
+	}
+	if err != nil {
+		return "", err
+	}
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		rel = "."
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute access paths are not allowed: %s", rel)
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("access path escapes scope %q: %s", scope, rel)
+	}
+	resolved := filepath.Join(base, clean)
+	baseClean := filepath.Clean(base)
+	resolvedClean := filepath.Clean(resolved)
+	if resolvedClean != baseClean && !strings.HasPrefix(resolvedClean, baseClean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("access path escapes scope %q: %s", scope, rel)
+	}
+	if allowDir {
+		info, err := os.Stat(resolvedClean)
+		if err != nil {
+			return "", fmt.Errorf("stat access path %s: %w", resolvedClean, err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("access path is not a directory: %s", rel)
+		}
+	}
+	return resolvedClean, nil
+}
+
+func (r runtimeAccessService) resolveScriptName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("script name is required")
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".js") {
+		name += ".js"
+	}
+	return r.resolve("scripts", name, false)
 }
 
 type runtimeStateStore struct {
@@ -5450,6 +6270,8 @@ func configGetValue(cfg *config.Config, key string) (string, error) {
 		return strconv.FormatFloat(cfg.Location.Longitude, 'f', -1, 64), nil
 	case "location.time_zone":
 		return cfg.Location.TimeZone, nil
+	case "access.path":
+		return strings.TrimSpace(cfg.Access.Path), nil
 	default:
 		return "", fmt.Errorf("unsupported config key %q", key)
 	}
@@ -5528,6 +6350,9 @@ func configSetValue(cfg *config.Config, key, value string) error {
 	case "location.time_zone":
 		cfg.Location.TimeZone = strings.TrimSpace(value)
 		return nil
+	case "access.path":
+		cfg.Access.Path = strings.TrimSpace(value)
+		return nil
 	default:
 		return fmt.Errorf("unsupported config key %q", key)
 	}
@@ -5588,6 +6413,59 @@ func loadMediaSource(ctx context.Context, source string) ([]byte, error) {
 		return nil, fmt.Errorf("read media source: %w", err)
 	}
 	return data, nil
+}
+
+func resolveSpeakerMediaSource(cfg *config.Config, source string) (string, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", errors.New("media source is required")
+	}
+	if looksLikeURL(source) {
+		return source, nil
+	}
+	if filepath.IsAbs(source) {
+		info, err := os.Stat(source)
+		if err != nil {
+			return "", fmt.Errorf("stat media source %s: %w", source, err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("media source is a directory: %s", source)
+		}
+		return source, nil
+	}
+	if info, err := os.Stat(source); err == nil {
+		if info.IsDir() {
+			return "", fmt.Errorf("media source is a directory: %s", source)
+		}
+		return source, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat media source %s: %w", source, err)
+	}
+	if err := config.EnsureAccessLayout(cfg); err != nil {
+		return "", err
+	}
+	base, err := config.AccessSoundsDir(cfg)
+	if err != nil {
+		return "", err
+	}
+	clean := filepath.Clean(source)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("media source escapes access/sounds: %s", source)
+	}
+	resolved := filepath.Join(base, clean)
+	baseClean := filepath.Clean(base)
+	resolvedClean := filepath.Clean(resolved)
+	if resolvedClean != baseClean && !strings.HasPrefix(resolvedClean, baseClean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("media source escapes access/sounds: %s", source)
+	}
+	info, err := os.Stat(resolvedClean)
+	if err != nil {
+		return "", fmt.Errorf("stat media source %s: %w", resolvedClean, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("media source is a directory: %s", resolvedClean)
+	}
+	return resolvedClean, nil
 }
 
 type wavFormat struct {

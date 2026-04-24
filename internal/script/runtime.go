@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -49,6 +50,22 @@ type HTTPClient interface {
 	Do(ctx context.Context, method, url string, body any, headers map[string]string) (map[string]any, error)
 }
 
+type ToolService interface {
+	Run(ctx context.Context, name string, args []string, stdin string, timeoutSeconds int) (map[string]any, error)
+}
+
+type AccessService interface {
+	Root(ctx context.Context) (string, error)
+	List(ctx context.Context, scope, path string) ([]map[string]any, error)
+	ReadText(ctx context.Context, scope, path string) (string, error)
+	WriteText(ctx context.Context, scope, path, value string) error
+	ReadJSON(ctx context.Context, scope, path string) (any, error)
+	WriteJSON(ctx context.Context, scope, path string, value any) error
+	Delete(ctx context.Context, scope, path string) error
+	ListScripts(ctx context.Context) ([]map[string]any, error)
+	RunScript(ctx context.Context, name string, args []string, input any) (any, error)
+}
+
 type Logger interface {
 	Printf(format string, args ...any)
 }
@@ -61,8 +78,15 @@ type ExecContext struct {
 	SpeakersSnapshot []map[string]any
 	State            StateStore
 	HTTP             HTTPClient
+	Tools            ToolService
+	Access           AccessService
 	Logger           Logger
 	Now              func() time.Time
+	ScriptArgs       []string
+	ScriptInput      any
+	StdinText        string
+	Stdout           io.Writer
+	Stderr           io.Writer
 }
 
 type Result struct {
